@@ -104,4 +104,9 @@ class GithubClient
         $url = sprintf('%s/repos/%s/%s/commits?path=%s&per_page=%d', $this->apiBase, $this->owner, $this->repo, $path, $limit);
         return $this->request('GET', $url);
     }
+
+    public function getRawUrl(string $path): string
+    {
+        return sprintf('https://raw.githubusercontent.com/%s/%s/%s/%s', $this->owner, $this->repo, $this->branch, $path);
+    }
 }
