@@ -173,15 +173,42 @@ $collectFolders = static function (array $nodes, string $docsRoot) use (&$collec
     return $folders;
 };
 
+$filterTreeByAccess = static function (array $nodes) use (&$filterTreeByAccess, $access): array {
+    $filtered = [];
+
+    foreach ($nodes as $node) {
+        if (($node['type'] ?? '') === 'file') {
+            if ($access->canRead($node['path'])) {
+                $filtered[] = $node;
+            }
+            continue;
+        }
+
+        if (($node['type'] ?? '') === 'dir') {
+            $children = $filterTreeByAccess($node['children'] ?? []);
+
+            if (!$access->isHidden($node['path']) || !empty($children)) {
+                $node['children'] = $children;
+                $filtered[] = $node;
+            }
+        }
+    }
+
+    return $filtered;
+};
+
 try {
     $docsTree = $github->getDocsTree($docsPath);
     $flatDocuments = $collectFiles($docsTree);
     $folderOptions = $collectFolders($docsTree, $docsPath);
+
+    $docsTree = $filterTreeByAccess($docsTree);
+    $flatDocuments = array_values(array_filter($flatDocuments, fn($doc) => $access->canRead($doc['path'])));
 } catch (Throwable $e) {
     $errors[] = 'Не удалось загрузить список документов: ' . $e->getMessage();
 }
 
-if (!$selectedPath && !empty($flatDocuments[0]['path'])) {
+if ((!$selectedPath || !$access->canRead($selectedPath)) && !empty($flatDocuments[0]['path'])) {
     $selectedPath = $flatDocuments[0]['path'];
 }
 
@@ -228,6 +255,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $history = $github->getHistory($path, 5);
                     $docsTree = $github->getDocsTree($docsPath);
                     $flatDocuments = $collectFiles($docsTree);
+                    $docsTree = $filterTreeByAccess($docsTree);
+                    $flatDocuments = array_values(array_filter($flatDocuments, fn($doc) => $access->canRead($doc['path'])));
                 } catch (Throwable $e) {
                     $errors[] = 'Не удалось сохранить документ: ' . $e->getMessage();
                 }
@@ -274,6 +303,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $history = $github->getHistory($uploadPath, 5);
                     $docsTree = $github->getDocsTree($docsPath);
                     $flatDocuments = $collectFiles($docsTree);
+                    $docsTree = $filterTreeByAccess($docsTree);
+                    $flatDocuments = array_values(array_filter($flatDocuments, fn($doc) => $access->canRead($doc['path'])));
                 } catch (Throwable $e) {
                     $errors[] = 'Не удалось загрузить документ: ' . $e->getMessage();
                 }

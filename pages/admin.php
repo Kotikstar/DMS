@@ -2,6 +2,7 @@
 session_start();
 require_once __DIR__ . '/../db.php';
 require_once __DIR__ . '/../services/AccessControl.php';
+require_once __DIR__ . '/../services/GithubClient.php';
 
 if (empty($_SESSION['role_id']) || (int)$_SESSION['role_id'] !== 1) {
     header('Location: /pages/dashboard.php');
@@ -15,12 +16,123 @@ $currentUser = $userStmt->fetch();
 $users = $pdo->query('SELECT u.id, u.username, u.email, r.role_name FROM users u JOIN roles r ON r.id = u.role_id')->fetchAll();
 $roles = $pdo->query('SELECT * FROM roles')->fetchAll();
 $aclRows = $pdo->query('SELECT * FROM document_acl ORDER BY document_path')->fetchAll();
+$docsFolders = [];
+$config = require __DIR__ . '/../config/github.php';
+$docsRoot = $config['docs_path'] ?? 'docs';
+$github = new GithubClient($config);
+
+$collectFolders = static function (array $nodes, string $root) use (&$collectFolders): array {
+    $folders = [$root];
+
+    foreach ($nodes as $node) {
+        if (($node['type'] ?? '') === 'dir') {
+            $folders[] = $node['path'];
+            $folders = array_merge($folders, $collectFolders($node['children'] ?? [], $root));
+        }
+    }
+
+    $folders = array_values(array_unique(array_filter($folders)));
+    sort($folders);
+
+    return $folders;
+};
+
+try {
+    $tree = $github->getDocsTree($docsRoot);
+    $docsFolders = $collectFolders($tree, $docsRoot);
+} catch (Throwable $e) {
+    $error = 'Не удалось загрузить дерево документов: ' . $e->getMessage();
+}
+
+$normalizePath = static function (string $path, string $base): string {
+    $cleanBase = trim($base, '/');
+    $clean = trim($path, '/');
+
+    if ($clean === '' || $clean === '.') {
+        return $cleanBase;
+    }
+
+    if ($cleanBase && stripos($clean, $cleanBase . '/') !== 0 && $clean !== $cleanBase) {
+        $clean = $cleanBase . '/' . $clean;
+    }
+
+    return $clean;
+};
 
 $success = null;
-$error = null;
+$error = $error ?? null;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (isset($_POST['user_id'], $_POST['role_id'])) {
+    $action = $_POST['action'] ?? '';
+
+    if ($action === 'create_user') {
+        $username = trim($_POST['new_username'] ?? '');
+        $email = trim($_POST['new_email'] ?? '');
+        $passkey = trim($_POST['new_passkey'] ?? '');
+        $role_id = (int) ($_POST['new_role_id'] ?? 3);
+
+        if ($username === '' || $email === '' || $passkey === '') {
+            $error = 'Заполните имя, email и пасс-ключ.';
+        } else {
+            try {
+                $hash = password_hash($passkey, PASSWORD_BCRYPT);
+                $stmt = $pdo->prepare('INSERT INTO users (username, email, passkey_label, passkey_hash, role_id) VALUES (:username, :email, :label, :hash, :role_id)');
+                $stmt->execute([
+                    'username' => $username,
+                    'email' => $email,
+                    'label' => $passkey,
+                    'hash' => $hash,
+                    'role_id' => $role_id,
+                ]);
+
+                $newUserId = (int) $pdo->lastInsertId();
+
+                $fullAccess = $_POST['full_access_paths'] ?? [];
+                $readOnly = $_POST['read_access_paths'] ?? [];
+                $hidden = $_POST['hidden_paths'] ?? [];
+
+                $insertAcl = $pdo->prepare('INSERT INTO document_acl (document_path, user_id, role_id, can_read, can_write) VALUES (:path, :user_id, NULL, :can_read, :can_write)
+                    ON DUPLICATE KEY UPDATE can_read = VALUES(can_read), can_write = VALUES(can_write)');
+
+                foreach ($fullAccess as $path) {
+                    $cleanPath = $normalizePath((string) $path, $docsRoot);
+                    $insertAcl->execute([
+                        'path' => $cleanPath,
+                        'user_id' => $newUserId,
+                        'can_read' => 1,
+                        'can_write' => 1,
+                    ]);
+                }
+
+                foreach ($readOnly as $path) {
+                    $cleanPath = $normalizePath((string) $path, $docsRoot);
+                    $insertAcl->execute([
+                        'path' => $cleanPath,
+                        'user_id' => $newUserId,
+                        'can_read' => 1,
+                        'can_write' => 0,
+                    ]);
+                }
+
+                foreach ($hidden as $path) {
+                    $cleanPath = $normalizePath((string) $path, $docsRoot);
+                    $insertAcl->execute([
+                        'path' => $cleanPath,
+                        'user_id' => $newUserId,
+                        'can_read' => 0,
+                        'can_write' => 0,
+                    ]);
+                }
+
+                $success = 'Пользователь создан и права применены.';
+                $users = $pdo->query('SELECT u.id, u.username, u.email, r.role_name FROM users u JOIN roles r ON r.id = u.role_id')->fetchAll();
+            } catch (Throwable $e) {
+                $error = 'Не удалось создать пользователя: ' . $e->getMessage();
+            }
+        }
+    }
+
+    if ($action === 'update_role' && isset($_POST['user_id'], $_POST['role_id'])) {
         $user_id = (int) $_POST['user_id'];
         $role_id = (int) $_POST['role_id'];
         $query = $pdo->prepare('UPDATE users SET role_id = :role_id WHERE id = :user_id');
@@ -28,8 +140,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $success = 'Роль пользователя обновлена.';
     }
 
-    if (isset($_POST['document_path'])) {
-        $path = trim($_POST['document_path']);
+    if ($action === 'save_acl' && isset($_POST['document_path'])) {
+        $path = $normalizePath(trim($_POST['document_path']), $docsRoot);
         $role_id = !empty($_POST['acl_role_id']) ? (int) $_POST['acl_role_id'] : null;
         $user_id = !empty($_POST['acl_user_id']) ? (int) $_POST['acl_user_id'] : null;
         $can_read = isset($_POST['can_read']) ? 1 : 0;
@@ -106,6 +218,85 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
     </div>
 
+    <div class="relative mb-6 p-6 rounded-3xl bg-white/5 border border-white/10 backdrop-blur-xl shadow-xl shadow-emerald-500/10">
+        <div class="flex flex-col lg:flex-row lg:items-start gap-4 mb-4">
+            <div class="flex items-center gap-3">
+                <span class="h-10 w-10 rounded-2xl bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center text-slate-900 font-black">+</span>
+                <div>
+                    <h2 class="text-xl font-semibold text-white">Создание пользователя</h2>
+                    <p class="text-slate-300/80 text-sm">Пасскей вход, роль и предустановленные права на папки docs.</p>
+                </div>
+            </div>
+            <div class="flex-1 lg:text-right text-slate-300/70 text-sm">Папки/подпапки можно выбрать сразу: где полный доступ, только чтение или скрыть.</div>
+        </div>
+
+        <form method="POST" class="grid lg:grid-cols-3 gap-4">
+            <input type="hidden" name="action" value="create_user">
+            <div class="space-y-3 lg:col-span-2">
+                <div class="grid md:grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-sm font-semibold text-slate-200 mb-2">Имя пользователя</label>
+                        <input type="text" name="new_username" required class="w-full p-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-400/60" placeholder="Иван Иваныч">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-semibold text-slate-200 mb-2">Email</label>
+                        <input type="email" name="new_email" required class="w-full p-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-400/60" placeholder="user@example.com">
+                    </div>
+                </div>
+                <div class="grid md:grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-sm font-semibold text-slate-200 mb-2">Пасс-ключ</label>
+                        <input type="text" name="new_passkey" required class="w-full p-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-400/60" placeholder="скан пальца / код">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-semibold text-slate-200 mb-2">Роль</label>
+                        <select name="new_role_id" class="w-full p-3 bg-white/5 border border-white/10 rounded-xl text-white focus:outline-none focus:ring-2 focus:ring-cyan-400/60">
+                            <?php foreach ($roles as $role): ?>
+                                <option value="<?= $role['id']; ?>" class="bg-slate-900"><?= htmlspecialchars($role['role_name']); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                </div>
+                <div class="grid md:grid-cols-3 gap-3">
+                    <div>
+                        <label class="block text-sm font-semibold text-slate-200 mb-2">Полный доступ</label>
+                        <select name="full_access_paths[]" multiple class="w-full min-h-[140px] p-3 bg-white/5 border border-white/10 rounded-xl text-white focus:outline-none focus:ring-2 focus:ring-emerald-400/60">
+                            <?php foreach ($docsFolders as $folder): ?>
+                                <option value="<?= htmlspecialchars($folder); ?>" class="bg-slate-900"><?= htmlspecialchars($folder); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <p class="text-xs text-slate-400 mt-1">Чтение + запись.</p>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-semibold text-slate-200 mb-2">Только чтение</label>
+                        <select name="read_access_paths[]" multiple class="w-full min-h-[140px] p-3 bg-white/5 border border-white/10 rounded-xl text-white focus:outline-none focus:ring-2 focus:ring-blue-400/60">
+                            <?php foreach ($docsFolders as $folder): ?>
+                                <option value="<?= htmlspecialchars($folder); ?>" class="bg-slate-900"><?= htmlspecialchars($folder); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <p class="text-xs text-slate-400 mt-1">Видит, но не редактирует.</p>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-semibold text-slate-200 mb-2">Скрыть</label>
+                        <select name="hidden_paths[]" multiple class="w-full min-h-[140px] p-3 bg-white/5 border border-white/10 rounded-xl text-white focus:outline-none focus:ring-2 focus:ring-pink-400/60">
+                            <?php foreach ($docsFolders as $folder): ?>
+                                <option value="<?= htmlspecialchars($folder); ?>" class="bg-slate-900"><?= htmlspecialchars($folder); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <p class="text-xs text-slate-400 mt-1">Не увидит в дереве и списках.</p>
+                    </div>
+                </div>
+            </div>
+            <div class="flex flex-col gap-3 justify-between">
+                <div class="p-4 rounded-2xl border border-white/10 bg-white/5 text-sm text-slate-200 shadow-inner shadow-emerald-500/10">
+                    <p class="font-semibold text-white mb-2">Где это хранится?</p>
+                    <p class="text-slate-300/80">Права кладём в ACL MySQL, а документы — в GitHub внутри <?= htmlspecialchars($docsRoot); ?>.</p>
+                </div>
+                <button type="submit" class="w-full px-6 py-3 rounded-xl bg-gradient-to-r from-emerald-400 via-cyan-400 to-blue-500 text-slate-900 font-semibold shadow-lg shadow-emerald-500/25 hover:shadow-xl transition">Создать аккаунт</button>
+            </div>
+        </form>
+    </div>
+
     <div class="relative grid lg:grid-cols-2 gap-6">
         <div class="p-6 rounded-3xl bg-white/5 border border-white/10 backdrop-blur-xl shadow-xl shadow-emerald-500/10">
             <div class="flex items-center gap-3 mb-4">
@@ -116,6 +307,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 </div>
             </div>
             <form method="POST" class="space-y-5">
+                <input type="hidden" name="action" value="update_role">
                 <div>
                     <label for="user_id" class="block text-sm font-semibold text-slate-200 mb-2">Выберите пользователя</label>
                     <div class="relative">
@@ -158,9 +350,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 </div>
             </div>
             <form method="POST" class="space-y-5">
+                <input type="hidden" name="action" value="save_acl">
                 <div>
                     <label class="block text-sm font-semibold text-slate-200 mb-2">Путь документа</label>
-                    <input type="text" name="document_path" required placeholder="docs/specs/security.md" class="w-full p-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-400/60">
+                    <input type="text" name="document_path" list="docs-paths" required placeholder="docs/specs/security.md" class="w-full p-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-400/60">
+                    <datalist id="docs-paths">
+                        <?php foreach ($docsFolders as $folder): ?>
+                            <option value="<?= htmlspecialchars($folder); ?>/"></option>
+                        <?php endforeach; ?>
+                    </datalist>
                 </div>
                 <div class="grid grid-cols-2 gap-3">
                     <div>
