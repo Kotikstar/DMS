@@ -24,7 +24,8 @@ $github = new GithubClient($config);
 $access = new AccessControl($pdo, $user);
 
 $docsPath = $config['docs_path'];
-$documents = [];
+$docsTree = [];
+$flatDocuments = [];
 $selectedPath = $_GET['path'] ?? '';
 $selectedDocument = null;
 $history = [];
@@ -139,14 +140,31 @@ $buildDocxFromText = static function (string $text): string {
     return $binary;
 };
 
+$collectFiles = static function (array $nodes) use (&$collectFiles): array {
+    $files = [];
+
+    foreach ($nodes as $node) {
+        if (($node['type'] ?? '') === 'file') {
+            $files[] = $node;
+        }
+
+        if (($node['type'] ?? '') === 'dir') {
+            $files = array_merge($files, $collectFiles($node['children'] ?? []));
+        }
+    }
+
+    return $files;
+};
+
 try {
-    $documents = $github->listDocuments($docsPath);
+    $docsTree = $github->getDocsTree($docsPath);
+    $flatDocuments = $collectFiles($docsTree);
 } catch (Throwable $e) {
     $errors[] = 'Не удалось загрузить список документов: ' . $e->getMessage();
 }
 
-if (!$selectedPath && !empty($documents[0]['path'])) {
-    $selectedPath = $documents[0]['path'];
+if (!$selectedPath && !empty($flatDocuments[0]['path'])) {
+    $selectedPath = $flatDocuments[0]['path'];
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -190,7 +208,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $selectedPath = $path;
                     $selectedDocument = $github->getDocument($path);
                     $history = $github->getHistory($path, 5);
-                    $documents = $github->listDocuments($docsPath);
+                    $docsTree = $github->getDocsTree($docsPath);
+                    $flatDocuments = $collectFiles($docsTree);
                 } catch (Throwable $e) {
                     $errors[] = 'Не удалось сохранить документ: ' . $e->getMessage();
                 }
@@ -235,7 +254,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $selectedPath = $uploadPath;
                     $selectedDocument = $github->getDocument($uploadPath);
                     $history = $github->getHistory($uploadPath, 5);
-                    $documents = $github->listDocuments($docsPath);
+                    $docsTree = $github->getDocsTree($docsPath);
+                    $flatDocuments = $collectFiles($docsTree);
                 } catch (Throwable $e) {
                     $errors[] = 'Не удалось загрузить документ: ' . $e->getMessage();
                 }
@@ -260,6 +280,41 @@ $isPdf = (bool) preg_match('/\.pdf$/i', $selectedPath);
 $docxText = ($isWordDocument && $selectedDocument) ? $extractDocxText($selectedDocument['content']) : null;
 $selectedSize = $selectedDocument ? strlen($selectedDocument['content']) : 0;
 $downloadUrl = $selectedPath ? '/download.php?path=' . urlencode($selectedPath) : '';
+$renderNode = static function (array $node, int $depth = 0) use (&$renderNode, $selectedPath) {
+    $indent = max(0, $depth * 12);
+    $isDir = ($node['type'] ?? '') === 'dir';
+    $isActive = !$isDir && ($node['path'] ?? '') === $selectedPath;
+    ?>
+    <li class="pl-<?= $indent; ?>">
+        <div class="flex items-center justify-between gap-3 rounded-2xl px-3 py-2 <?= $isDir ? 'bg-white/5 border border-white/5' : 'hover:bg-white/5 border border-transparent'; ?> <?= $isActive ? 'border-emerald-400/40 bg-emerald-500/10' : ''; ?>">
+            <div class="flex items-center gap-3 min-w-0">
+                <span class="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-white/10 border border-white/10 text-[11px] uppercase text-emerald-100">
+                    <?= htmlspecialchars($isDir ? 'dir' : (pathinfo($node['name'] ?? '', PATHINFO_EXTENSION) ?: 'file')); ?>
+                </span>
+                <div class="min-w-0">
+                    <p class="text-sm font-semibold text-white truncate"><?= htmlspecialchars($node['name'] ?? ''); ?></p>
+                    <p class="text-xs text-slate-400 truncate"><?= htmlspecialchars($node['path'] ?? ''); ?></p>
+                </div>
+            </div>
+            <div class="flex items-center gap-2 text-sm">
+                <?php if ($isDir): ?>
+                    <span class="text-slate-400">Папка</span>
+                <?php else: ?>
+                    <a class="text-emerald-200 hover:text-emerald-100" href="?path=<?= urlencode($node['path'] ?? ''); ?>">Открыть</a>
+                    <a class="text-slate-400 hover:text-white/80" href="/download.php?path=<?= urlencode($node['path'] ?? ''); ?>" title="Скачать">⇩</a>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php if ($isDir && !empty($node['children'])): ?>
+            <ul class="mt-2 space-y-2">
+                <?php foreach ($node['children'] as $child): ?>
+                    <?php $renderNode($child, $depth + 1); ?>
+                <?php endforeach; ?>
+            </ul>
+        <?php endif; ?>
+    </li>
+    <?php
+};
 ?>
 <?php require_once __DIR__ . '/../components/header.php'; ?>
 <div class="max-w-7xl mx-auto px-4 py-12 relative">
@@ -291,35 +346,38 @@ $downloadUrl = $selectedPath ? '/download.php?path=' . urlencode($selectedPath) 
     <?php endif; ?>
 
     <div class="grid lg:grid-cols-3 gap-6">
-        <div class="lg:col-span-1 rounded-3xl bg-white/5 border border-white/10 backdrop-blur-xl p-5">
-            <div class="flex items-center justify-between mb-4">
-                <h2 class="text-xl font-semibold text-white">Документы</h2>
-                <a class="text-sm text-emerald-200 hover:text-emerald-100" href="?">Обновить</a>
-            </div>
-            <?php if (empty($documents)): ?>
-                <p class="text-slate-400 text-sm">Нет документов или не настроен GitHub токен.</p>
-            <?php else: ?>
-                <ul class="divide-y divide-white/10">
-                    <?php foreach ($documents as $doc): ?>
-                        <?php $ext = strtolower(pathinfo($doc['name'] ?? '', PATHINFO_EXTENSION)); ?>
-                        <li class="py-3 flex items-center justify-between">
-                            <div>
-                                <p class="text-sm font-semibold text-white flex items-center gap-2">
-                                    <span class="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-white/5 border border-white/10 text-xs uppercase"><?= htmlspecialchars($ext ?: 'file'); ?></span>
-                                    <?= htmlspecialchars($doc['name']); ?>
-                                </p>
-                                <p class="text-xs text-slate-400 truncate max-w-[220px]"><?= htmlspecialchars($doc['path']); ?></p>
-                            </div>
-                            <div class="flex items-center gap-3">
-                                <a class="text-emerald-200 hover:text-emerald-100 text-sm" href="?path=<?= urlencode($doc['path']); ?>">Открыть</a>
-                                <a class="text-slate-400 hover:text-white/80 text-sm" href="/download.php?path=<?= urlencode($doc['path']); ?>">⇩</a>
-                            </div>
-                        </li>
-                    <?php endforeach; ?>
-                </ul>
-            <?php endif; ?>
-            <div class="mt-4 p-3 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-100 text-sm">
-                Все версии фиксируются коммитами в GitHub. Путь для загрузки определяется автоматически.
+        <div class="lg:col-span-1">
+            <div class="relative overflow-hidden rounded-3xl border border-white/10 bg-gradient-to-br from-slate-900/80 via-slate-900/70 to-emerald-900/40 p-5 shadow-2xl shadow-emerald-900/30">
+                <div class="absolute inset-0 pointer-events-none bg-[radial-gradient(circle_at_20%_20%,rgba(16,185,129,0.12),transparent_45%),radial-gradient(circle_at_80%_0%,rgba(59,130,246,0.12),transparent_40%)]"></div>
+                <div class="flex items-center justify-between mb-5 relative z-10">
+                    <div>
+                        <p class="text-xs uppercase tracking-[0.2em] text-emerald-200/80">Docs index</p>
+                        <h2 class="text-2xl font-semibold text-white">Документы</h2>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span class="px-3 py-1 rounded-lg bg-white/5 border border-white/10 text-xs text-slate-200">Папка: <?= htmlspecialchars($docsPath); ?></span>
+                        <a class="text-sm text-emerald-200 hover:text-emerald-100 px-3 py-2 rounded-xl bg-white/5 border border-white/10" href="?">Обновить</a>
+                    </div>
+                </div>
+
+                <div class="relative z-10">
+                    <?php if (empty($docsTree)): ?>
+                        <p class="text-slate-400 text-sm">Нет документов или не настроен GitHub токен.</p>
+                    <?php else: ?>
+                        <ul class="space-y-2">
+                            <?php foreach ($docsTree as $node): ?>
+                                <?php $renderNode($node); ?>
+                            <?php endforeach; ?>
+                        </ul>
+                    <?php endif; ?>
+                    <div class="mt-4 p-4 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-50 text-sm flex items-start gap-3">
+                        <span class="mt-0.5">✔</span>
+                        <div>
+                            <p class="font-semibold">Версионирование и ACL</p>
+                            <p class="text-emerald-100/80">Все изменения фиксируются коммитами в GitHub, права доступа контролируются ACL. Индексация охватывает всю папку docs и вложенные каталоги.</p>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -432,16 +490,13 @@ $downloadUrl = $selectedPath ? '/download.php?path=' . urlencode($selectedPath) 
     </div>
 
     <div class="mt-10 grid lg:grid-cols-2 gap-6">
-        <div class="rounded-3xl bg-white/5 border border-white/10 backdrop-blur-xl p-6">
-            <h3 class="text-xl font-semibold text-white mb-4">Создать новый документ</h3>
+        <div class="rounded-3xl bg-gradient-to-br from-slate-900/70 via-slate-900/60 to-blue-900/40 border border-white/10 backdrop-blur-xl p-6 shadow-xl shadow-emerald-900/30">
+            <h3 class="text-xl font-semibold text-white mb-2">Создать новый документ</h3>
+            <p class="text-sm text-slate-300 mb-4">Без ручного выбора пути: файл автоматически попадёт в папку docs.</p>
             <form method="POST" class="grid md:grid-cols-4 gap-4 items-center">
                 <input type="hidden" name="action" value="create">
-                <div>
-                    <label class="block text-sm font-semibold text-slate-200 mb-2">Папка</label>
-                    <input type="text" name="new_folder" value="<?= htmlspecialchars($docsPath); ?>" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
-                    <p class="text-xs text-slate-400 mt-1">Можно оставить по умолчанию — файл попадёт в общую папку документов.</p>
-                </div>
-                <div>
+                <input type="hidden" name="new_folder" value="<?= htmlspecialchars($docsPath); ?>">
+                <div class="md:col-span-2">
                     <label class="block text-sm font-semibold text-slate-200 mb-2">Имя файла</label>
                     <input type="text" name="new_filename" required placeholder="new-file.md" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
                 </div>
@@ -453,31 +508,32 @@ $downloadUrl = $selectedPath ? '/download.php?path=' . urlencode($selectedPath) 
                     <label class="block text-sm font-semibold text-slate-200 mb-2">Содержимое</label>
                     <textarea name="content" rows="6" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500" placeholder="# Новый документ\nОписание ..."></textarea>
                 </div>
-                <div class="md:col-span-4 flex justify-end">
+                <div class="md:col-span-4 flex items-center justify-between text-xs text-emerald-100/80 bg-emerald-500/10 border border-emerald-500/30 rounded-2xl px-4 py-3">
+                    <span>Путь: <?= htmlspecialchars($docsPath); ?>/… • Коммиты формируют версии автоматически.</span>
                     <button type="submit" class="px-6 py-3 bg-emerald-500 text-slate-900 font-semibold rounded-xl hover:bg-emerald-400 transition">Создать и закоммитить</button>
                 </div>
             </form>
         </div>
 
-        <div class="rounded-3xl bg-white/5 border border-white/10 backdrop-blur-xl p-6">
-            <h3 class="text-xl font-semibold text-white mb-4">Загрузить файл (Word/PDF)</h3>
+        <div class="rounded-3xl bg-gradient-to-br from-slate-900/70 via-slate-900/60 to-emerald-900/40 border border-white/10 backdrop-blur-xl p-6 shadow-xl shadow-emerald-900/30">
+            <h3 class="text-xl font-semibold text-white mb-2">Загрузить файл (Word/PDF/TXT)</h3>
+            <p class="text-sm text-slate-300 mb-4">Папка определяется автоматически. Поддержка DOC/DOCX, PDF, TXT и Markdown.</p>
             <form method="POST" enctype="multipart/form-data" class="space-y-4">
                 <input type="hidden" name="action" value="upload">
+                <input type="hidden" name="upload_folder" value="<?= htmlspecialchars($docsPath); ?>">
                 <div class="grid md:grid-cols-2 gap-4">
-                    <div>
-                        <label class="block text-sm font-semibold text-slate-200 mb-2">Папка сохранения</label>
-                        <input type="text" name="upload_folder" value="<?= htmlspecialchars($docsPath); ?>" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
-                        <p class="text-xs text-slate-400 mt-1">Путь вычисляется сам — можно ничего не менять.</p>
-                    </div>
                     <div>
                         <label class="block text-sm font-semibold text-slate-200 mb-2">Комментарий к коммиту</label>
                         <input type="text" name="upload_message" value="Загрузка документа" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                    </div>
+                    <div class="flex items-end">
+                        <div class="w-full text-right text-xs text-emerald-100 bg-white/5 border border-white/10 rounded-xl px-3 py-2">Целевая папка: <?= htmlspecialchars($docsPath); ?></div>
                     </div>
                 </div>
                 <div>
                     <label class="block text-sm font-semibold text-slate-200 mb-2">Файл</label>
                     <input type="file" name="document_file" accept=".doc,.docx,.pdf,.txt,.md" class="w-full text-sm text-slate-200 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-emerald-500 file:text-slate-900 file:font-semibold">
-                    <p class="text-xs text-slate-400 mt-2">Файл кладётся в выбранную папку автоматически, без ручного пути.</p>
+                    <p class="text-xs text-slate-400 mt-2">Файл кладётся в docs автоматически, путь выбирать не нужно.</p>
                 </div>
                 <div class="flex justify-end">
                     <button type="submit" class="px-6 py-3 bg-emerald-500 text-slate-900 font-semibold rounded-xl hover:bg-emerald-400 transition">Загрузить в GitHub</button>
