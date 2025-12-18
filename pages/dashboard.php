@@ -26,6 +26,7 @@ $access = new AccessControl($pdo, $user);
 $docsPath = $config['docs_path'];
 $docsTree = [];
 $flatDocuments = [];
+$folderOptions = [];
 $selectedPath = $_GET['path'] ?? '';
 $selectedDocument = null;
 $history = [];
@@ -156,9 +157,26 @@ $collectFiles = static function (array $nodes) use (&$collectFiles): array {
     return $files;
 };
 
+$collectFolders = static function (array $nodes, string $docsRoot) use (&$collectFolders): array {
+    $folders = [$docsRoot];
+
+    foreach ($nodes as $node) {
+        if (($node['type'] ?? '') === 'dir') {
+            $folders[] = $node['path'];
+            $folders = array_merge($folders, $collectFolders($node['children'] ?? [], $docsRoot));
+        }
+    }
+
+    $folders = array_values(array_unique(array_filter($folders)));
+    sort($folders);
+
+    return $folders;
+};
+
 try {
     $docsTree = $github->getDocsTree($docsPath);
     $flatDocuments = $collectFiles($docsTree);
+    $folderOptions = $collectFolders($docsTree, $docsPath);
 } catch (Throwable $e) {
     $errors[] = 'Не удалось загрузить список документов: ' . $e->getMessage();
 }
@@ -492,10 +510,17 @@ $renderNode = static function (array $node, int $depth = 0) use (&$renderNode, $
     <div class="mt-10 grid lg:grid-cols-2 gap-6">
         <div class="rounded-3xl bg-gradient-to-br from-slate-900/70 via-slate-900/60 to-blue-900/40 border border-white/10 backdrop-blur-xl p-6 shadow-xl shadow-emerald-900/30">
             <h3 class="text-xl font-semibold text-white mb-2">Создать новый документ</h3>
-            <p class="text-sm text-slate-300 mb-4">Без ручного выбора пути: файл автоматически попадёт в папку docs.</p>
+            <p class="text-sm text-slate-300 mb-4">Выберите папку (или подпапку) внутри docs — путь подставится автоматически.</p>
             <form method="POST" class="grid md:grid-cols-4 gap-4 items-center">
                 <input type="hidden" name="action" value="create">
-                <input type="hidden" name="new_folder" value="<?= htmlspecialchars($docsPath); ?>">
+                <div class="md:col-span-2">
+                    <label class="block text-sm font-semibold text-slate-200 mb-2">Папка назначения</label>
+                    <select name="new_folder" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                        <?php foreach ($folderOptions as $folder): ?>
+                            <option value="<?= htmlspecialchars($folder); ?>" <?= $folder === $docsPath ? 'selected' : ''; ?>><?= htmlspecialchars($folder); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
                 <div class="md:col-span-2">
                     <label class="block text-sm font-semibold text-slate-200 mb-2">Имя файла</label>
                     <input type="text" name="new_filename" required placeholder="new-file.md" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
@@ -509,7 +534,7 @@ $renderNode = static function (array $node, int $depth = 0) use (&$renderNode, $
                     <textarea name="content" rows="6" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500" placeholder="# Новый документ\nОписание ..."></textarea>
                 </div>
                 <div class="md:col-span-4 flex items-center justify-between text-xs text-emerald-100/80 bg-emerald-500/10 border border-emerald-500/30 rounded-2xl px-4 py-3">
-                    <span>Путь: <?= htmlspecialchars($docsPath); ?>/… • Коммиты формируют версии автоматически.</span>
+                    <span>Путь: выбранная папка + имя файла • Коммиты формируют версии автоматически.</span>
                     <button type="submit" class="px-6 py-3 bg-emerald-500 text-slate-900 font-semibold rounded-xl hover:bg-emerald-400 transition">Создать и закоммитить</button>
                 </div>
             </form>
@@ -517,23 +542,28 @@ $renderNode = static function (array $node, int $depth = 0) use (&$renderNode, $
 
         <div class="rounded-3xl bg-gradient-to-br from-slate-900/70 via-slate-900/60 to-emerald-900/40 border border-white/10 backdrop-blur-xl p-6 shadow-xl shadow-emerald-900/30">
             <h3 class="text-xl font-semibold text-white mb-2">Загрузить файл (Word/PDF/TXT)</h3>
-            <p class="text-sm text-slate-300 mb-4">Папка определяется автоматически. Поддержка DOC/DOCX, PDF, TXT и Markdown.</p>
+            <p class="text-sm text-slate-300 mb-4">Выберите, куда положить файл. Поддержка DOC/DOCX, PDF, TXT и Markdown.</p>
             <form method="POST" enctype="multipart/form-data" class="space-y-4">
                 <input type="hidden" name="action" value="upload">
-                <input type="hidden" name="upload_folder" value="<?= htmlspecialchars($docsPath); ?>">
                 <div class="grid md:grid-cols-2 gap-4">
                     <div>
                         <label class="block text-sm font-semibold text-slate-200 mb-2">Комментарий к коммиту</label>
                         <input type="text" name="upload_message" value="Загрузка документа" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
                     </div>
-                    <div class="flex items-end">
-                        <div class="w-full text-right text-xs text-emerald-100 bg-white/5 border border-white/10 rounded-xl px-3 py-2">Целевая папка: <?= htmlspecialchars($docsPath); ?></div>
+                    <div>
+                        <label class="block text-sm font-semibold text-slate-200 mb-2">Папка назначения</label>
+                        <select name="upload_folder" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                            <?php foreach ($folderOptions as $folder): ?>
+                                <option value="<?= htmlspecialchars($folder); ?>" <?= $folder === $docsPath ? 'selected' : ''; ?>><?= htmlspecialchars($folder); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <p class="text-xs text-slate-400 mt-2">Путь в GitHub обновится автоматически.</p>
                     </div>
                 </div>
                 <div>
                     <label class="block text-sm font-semibold text-slate-200 mb-2">Файл</label>
                     <input type="file" name="document_file" accept=".doc,.docx,.pdf,.txt,.md" class="w-full text-sm text-slate-200 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-emerald-500 file:text-slate-900 file:font-semibold">
-                    <p class="text-xs text-slate-400 mt-2">Файл кладётся в docs автоматически, путь выбирать не нужно.</p>
+                    <p class="text-xs text-slate-400 mt-2">Путь обновляется выбранной папкой — не нужно вручную вводить директорию.</p>
                 </div>
                 <div class="flex justify-end">
                     <button type="submit" class="px-6 py-3 bg-emerald-500 text-slate-900 font-semibold rounded-xl hover:bg-emerald-400 transition">Загрузить в GitHub</button>
