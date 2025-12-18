@@ -33,13 +33,110 @@ $success = null;
 
 $normalizePath = static function (string $path, string $base): string {
     $cleanBase = trim($base, '/');
-    $cleanPath = ltrim($path, '/');
+    $cleanPath = trim($path, '/');
 
-    if ($cleanBase && $cleanPath && stripos($cleanPath, $cleanBase . '/') !== 0 && $cleanPath !== $cleanBase) {
+    if ($cleanPath === '') {
+        return $cleanBase;
+    }
+
+    if ($cleanBase && stripos($cleanPath, $cleanBase . '/') !== 0 && $cleanPath !== $cleanBase) {
         $cleanPath = $cleanBase . '/' . $cleanPath;
     }
 
-    return $cleanPath ?: $cleanBase;
+    return $cleanPath;
+};
+
+$extractDocxText = static function (string $binary): ?string {
+    $tmp = tempnam(sys_get_temp_dir(), 'docx');
+    if ($tmp === false) {
+        return null;
+    }
+
+    file_put_contents($tmp, $binary);
+    $zip = new ZipArchive();
+    $text = null;
+
+    if ($zip->open($tmp) === true) {
+        $xml = $zip->getFromName('word/document.xml');
+        if ($xml !== false) {
+            $xml = preg_replace('/<w:p[^>]*>/', "\n", $xml);
+            $xml = str_replace(['</w:p>', '</w:tab>'], "\n", $xml);
+            $text = trim(strip_tags($xml));
+        }
+        $zip->close();
+    }
+
+    @unlink($tmp);
+    return $text;
+};
+
+$buildDocxFromText = static function (string $text): string {
+    $tmp = tempnam(sys_get_temp_dir(), 'docx-build');
+    if ($tmp === false) {
+        throw new RuntimeException('Не удалось подготовить файл DOCX');
+    }
+
+    $zip = new ZipArchive();
+    if ($zip->open($tmp, ZipArchive::OVERWRITE) !== true) {
+        throw new RuntimeException('Не удалось создать DOCX архив');
+    }
+
+    $paragraphs = array_map('trim', preg_split('/\r?\n/', $text));
+    $body = '';
+    foreach ($paragraphs as $p) {
+        $escaped = htmlspecialchars($p ?: ' ', ENT_XML1);
+        $body .= '<w:p><w:r><w:t xml:space="preserve">' . $escaped . '</w:t></w:r></w:p>';
+    }
+
+    $documentXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        . '<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"'
+        . ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"'
+        . ' xmlns:o="urn:schemas-microsoft-com:office:office"'
+        . ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+        . ' xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"'
+        . ' xmlns:v="urn:schemas-microsoft-com:vml"'
+        . ' xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing"'
+        . ' xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
+        . ' xmlns:w10="urn:schemas-microsoft-com:office:word"'
+        . ' xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        . ' xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+        . ' xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"'
+        . ' xmlns:wpi="http://schemas.microsoft.com/office/word/2010/wordprocessingInk"'
+        . ' xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml"'
+        . ' xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"'
+        . ' mc:Ignorable="w14 wp14">'
+        . '<w:body>' . $body . '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr>'
+        . '</w:body></w:document>';
+
+    $zip->addFromString('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8"?>'
+        . '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        . '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        . '<Default Extension="xml" ContentType="application/xml"/>'
+        . '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        . '</Types>');
+
+    $zip->addFromString('_rels/.rels', '<?xml version="1.0" encoding="UTF-8"?>'
+        . '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        . '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+        . '</Relationships>');
+
+    $zip->addFromString('word/_rels/document.xml.rels', '<?xml version="1.0" encoding="UTF-8"?>'
+        . '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>');
+
+    $zip->addFromString('word/document.xml', $documentXml);
+    $zip->addFromString('docProps/app.xml', '<?xml version="1.0" encoding="UTF-8"?>'
+        . '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+        . '<Application>LC System</Application></Properties>');
+
+    $zip->addFromString('docProps/core.xml', '<?xml version="1.0" encoding="UTF-8"?>'
+        . '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        . '<dc:title>Документ LC System</dc:title></cp:coreProperties>');
+
+    $zip->close();
+    $binary = file_get_contents($tmp) ?: '';
+    @unlink($tmp);
+
+    return $binary;
 };
 
 try {
@@ -54,48 +151,70 @@ if (!$selectedPath && !empty($documents[0]['path'])) {
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
-    $path = trim($_POST['path'] ?? '');
 
     if ($action === 'create' || $action === 'update') {
-        $path = $normalizePath($path, $docsPath);
+        if ($action === 'create') {
+            $folder = trim($_POST['new_folder'] ?? $docsPath, '/');
+            $filename = trim($_POST['new_filename'] ?? '');
+            $path = $normalizePath(($folder ? $folder . '/' : '') . $filename, $docsPath);
+        } else {
+            $path = $normalizePath(trim($_POST['path'] ?? ''), $docsPath);
+        }
 
         if (empty($path)) {
-            $errors[] = 'Укажите путь для документа.';
+            $errors[] = 'Укажите имя документа.';
         }
 
         if (!$access->canWrite($path ?: $docsPath)) {
             $errors[] = 'У вас нет прав на запись для этого документа.';
         } else {
-            $content = (string)($_POST['content'] ?? '');
+            $rawContent = (string)($_POST['content'] ?? '');
             $message = trim($_POST['message'] ?? 'Обновление документа');
             $sha = $action === 'update' ? ($_POST['sha'] ?? null) : null;
 
-            try {
-                $github->saveDocument($path, $content, $message, $sha ?: null);
-                $success = 'Изменения отправлены в GitHub.';
-                $selectedPath = $path;
-                $selectedDocument = $github->getDocument($path);
-                $history = $github->getHistory($path, 5);
-                $documents = $github->listDocuments($docsPath);
-            } catch (Throwable $e) {
-                $errors[] = 'Не удалось сохранить документ: ' . $e->getMessage();
+            $extension = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+            $content = $rawContent;
+
+            if (in_array($extension, ['doc', 'docx'], true)) {
+                try {
+                    $content = $buildDocxFromText($rawContent);
+                } catch (Throwable $e) {
+                    $errors[] = 'DOCX-конвертер: ' . $e->getMessage();
+                }
+            }
+
+            if (!$errors) {
+                try {
+                    $github->saveDocument($path, $content, $message, $sha ?: null);
+                    $success = 'Изменения отправлены в GitHub.';
+                    $selectedPath = $path;
+                    $selectedDocument = $github->getDocument($path);
+                    $history = $github->getHistory($path, 5);
+                    $documents = $github->listDocuments($docsPath);
+                } catch (Throwable $e) {
+                    $errors[] = 'Не удалось сохранить документ: ' . $e->getMessage();
+                }
             }
         }
     }
 
     if ($action === 'upload') {
-        $uploadPath = $normalizePath(trim($_POST['upload_path'] ?? ''), $docsPath);
+        $targetFolder = trim($_POST['upload_folder'] ?? $docsPath);
+        if ($targetFolder === '' || $targetFolder === '.') {
+            $targetFolder = $docsPath;
+        }
+        $targetFolder = $normalizePath($targetFolder, $docsPath);
         $message = trim($_POST['upload_message'] ?? 'Загрузка документа');
         $file = $_FILES['document_file'] ?? null;
 
-        if (!$access->canWrite($uploadPath ?: $docsPath)) {
+        if (!$access->canWrite($targetFolder ?: $docsPath)) {
             $errors[] = 'У вас нет прав на загрузку в этот путь.';
         } elseif (!$file || ($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
             $errors[] = 'Файл не был загружен или произошла ошибка при загрузке.';
-        } elseif (empty($uploadPath)) {
-            $errors[] = 'Введите путь, куда сохранить файл.';
         } else {
-            $extension = strtolower(pathinfo($uploadPath ?: ($file['name'] ?? ''), PATHINFO_EXTENSION));
+            $safeName = preg_replace('/[^A-Za-z0-9._-]/', '_', $file['name'] ?? 'document');
+            $uploadPath = $normalizePath(($targetFolder ? $targetFolder . '/' : '') . $safeName, $docsPath);
+            $extension = strtolower(pathinfo($uploadPath, PATHINFO_EXTENSION));
             $allowed = ['doc', 'docx', 'pdf', 'txt', 'md'];
 
             if (!in_array($extension, $allowed, true)) {
@@ -137,15 +256,19 @@ if (!$selectedDocument && $selectedPath) {
 $selectedExtension = strtolower(pathinfo($selectedPath, PATHINFO_EXTENSION));
 $isTextual = (bool) preg_match('/\.(md|txt|json|yaml|yml|csv|xml|html)$/i', $selectedPath);
 $isWordDocument = (bool) preg_match('/\.(docx?|dotx?)$/i', $selectedPath);
+$isPdf = (bool) preg_match('/\.pdf$/i', $selectedPath);
+$docxText = ($isWordDocument && $selectedDocument) ? $extractDocxText($selectedDocument['content']) : null;
 $selectedSize = $selectedDocument ? strlen($selectedDocument['content']) : 0;
+$downloadUrl = $selectedPath ? '/download.php?path=' . urlencode($selectedPath) : '';
 ?>
 <?php require_once __DIR__ . '/../components/header.php'; ?>
-<div class="max-w-7xl mx-auto px-4 py-12">
+<div class="max-w-7xl mx-auto px-4 py-12 relative">
+    <div class="absolute inset-0 -z-10 bg-gradient-to-r from-emerald-500/10 via-blue-600/5 to-purple-500/10 blur-3xl"></div>
     <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-8">
         <div>
             <p class="inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs tracking-wide bg-emerald-500/10 text-emerald-200 border border-emerald-500/20">Secure • GitHub • Passkey</p>
             <h1 class="text-4xl font-bold text-white mt-3">Кабинет документов</h1>
-            <p class="text-slate-300">Версии из GitHub, загрузка Word/PDF и контроль доступа через ACL.</p>
+            <p class="text-slate-300">Предпросмотр, скачивание приватных файлов, загрузка Word/PDF и ACL-защита.</p>
         </div>
         <div class="flex items-center gap-3">
             <span class="px-4 py-2 rounded-xl bg-white/5 text-slate-100 text-sm border border-white/10">Роль: <?= htmlspecialchars($user['role_name']); ?></span>
@@ -189,14 +312,14 @@ $selectedSize = $selectedDocument ? strlen($selectedDocument['content']) : 0;
                             </div>
                             <div class="flex items-center gap-3">
                                 <a class="text-emerald-200 hover:text-emerald-100 text-sm" href="?path=<?= urlencode($doc['path']); ?>">Открыть</a>
-                                <a class="text-slate-400 hover:text-white/80 text-sm" target="_blank" rel="noreferrer" href="<?= htmlspecialchars($github->getRawUrl($doc['path'])); ?>">⇩</a>
+                                <a class="text-slate-400 hover:text-white/80 text-sm" href="/download.php?path=<?= urlencode($doc['path']); ?>">⇩</a>
                             </div>
                         </li>
                     <?php endforeach; ?>
                 </ul>
             <?php endif; ?>
             <div class="mt-4 p-3 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-100 text-sm">
-                Все версии фиксируются коммитами в GitHub.
+                Все версии фиксируются коммитами в GitHub. Путь для загрузки определяется автоматически.
             </div>
         </div>
 
@@ -230,20 +353,45 @@ $selectedSize = $selectedDocument ? strlen($selectedDocument['content']) : 0;
                                 <button type="submit" class="px-6 py-3 bg-emerald-500 text-slate-900 font-semibold rounded-xl shadow-lg shadow-emerald-500/30 hover:bg-emerald-400 transition" <?= $access->canWrite($selectedPath) ? '' : 'disabled'; ?>>Сохранить в GitHub</button>
                             </div>
                         </form>
+                    <?php elseif ($isWordDocument && $docxText !== null): ?>
+                        <form method="POST" class="space-y-4">
+                            <input type="hidden" name="action" value="update">
+                            <input type="hidden" name="path" value="<?= htmlspecialchars($selectedDocument['path']); ?>">
+                            <input type="hidden" name="sha" value="<?= htmlspecialchars($selectedDocument['sha']); ?>">
+
+                            <div class="rounded-2xl bg-blue-500/10 border border-blue-400/20 p-3 text-blue-100 text-sm">Быстрый текстовый режим DOCX. При сохранении создаётся новый документ Word без форматирования.</div>
+
+                            <label class="block text-sm font-semibold text-slate-100">Текст документа</label>
+                            <textarea name="content" rows="12" class="w-full p-4 bg-slate-900/40 text-slate-100 border border-white/10 rounded-2xl focus:outline-none focus:ring-2 focus:ring-emerald-500" <?= $access->canWrite($selectedPath) ? '' : 'readonly'; ?>><?= htmlspecialchars($docxText); ?></textarea>
+
+                            <div class="flex flex-col sm:flex-row gap-3 sm:items-center">
+                                <input type="text" name="message" class="flex-1 p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500" placeholder="Комментарий к коммиту" value="Обновление <?= htmlspecialchars($selectedDocument['name']); ?>">
+                                <button type="submit" class="px-6 py-3 bg-emerald-500 text-slate-900 font-semibold rounded-xl shadow-lg shadow-emerald-500/30 hover:bg-emerald-400 transition" <?= $access->canWrite($selectedPath) ? '' : 'disabled'; ?>>Сохранить DOCX</button>
+                            </div>
+                        </form>
                     <?php else: ?>
-                        <div class="rounded-2xl border border-white/10 bg-slate-900/40 p-5 text-slate-200 space-y-3">
-                            <p class="text-lg font-semibold flex items-center gap-2"><span class="text-xl">📄</span> Просмотр бинарных файлов</p>
-                            <p class="text-sm text-slate-400">Файл не отображается в редакторе. Скачайте документ или загрузите новую версию (DOCX/DOC/PDF).</p>
-                            <div class="flex flex-wrap gap-3">
-                                <a class="px-4 py-2 rounded-xl bg-white/10 border border-white/20 hover:border-emerald-400/40 text-sm" target="_blank" rel="noreferrer" href="<?= htmlspecialchars($github->getRawUrl($selectedPath)); ?>">Скачать из GitHub</a>
+                        <div class="rounded-2xl border border-white/10 bg-slate-900/40 p-5 text-slate-200 space-y-4">
+                            <div class="flex flex-wrap gap-3 items-center">
+                                <a class="px-4 py-2 rounded-xl bg-white/10 border border-white/20 hover:border-emerald-400/40 text-sm" href="<?= htmlspecialchars($downloadUrl); ?>">Скачать из GitHub</a>
                                 <?php if ($selectedSize): ?>
                                     <span class="px-4 py-2 rounded-xl bg-white/5 border border-white/10 text-xs text-slate-300">Размер: <?= number_format($selectedSize / 1024, 2); ?> КБ</span>
                                 <?php endif; ?>
                             </div>
+                            <?php if ($isPdf): ?>
+                                <div class="border border-white/10 rounded-xl overflow-hidden bg-black/40">
+                                    <object data="<?= htmlspecialchars($downloadUrl); ?>" type="application/pdf" width="100%" height="480px">
+                                        <p class="p-4 text-sm text-slate-300">PDF не удалось встроить, скачайте файл.</p>
+                                    </object>
+                                </div>
+                            <?php elseif ($isWordDocument): ?>
+                                <p class="text-sm text-slate-300">Предпросмотр Word недоступен. Скачайте файл или используйте текстовый режим выше.</p>
+                            <?php else: ?>
+                                <p class="text-sm text-slate-300">Файл не отображается в редакторе. Скачайте документ или загрузите новую версию.</p>
+                            <?php endif; ?>
                             <?php if ($access->canWrite($selectedPath)): ?>
-                                <form method="POST" enctype="multipart/form-data" class="mt-4 space-y-3">
+                                <form method="POST" enctype="multipart/form-data" class="mt-2 space-y-3">
                                     <input type="hidden" name="action" value="upload">
-                                    <input type="hidden" name="upload_path" value="<?= htmlspecialchars($selectedPath); ?>">
+                                    <input type="hidden" name="upload_folder" value="<?= htmlspecialchars(dirname($selectedPath) === '.' ? $docsPath : dirname($selectedPath)); ?>">
                                     <div>
                                         <label class="block text-sm text-slate-300 mb-2">Заменить файл</label>
                                         <input type="file" name="document_file" accept=".doc,.docx,.pdf,.txt,.md" class="w-full text-sm text-slate-200 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-emerald-500 file:text-slate-900 file:font-semibold">
@@ -288,11 +436,16 @@ $selectedSize = $selectedDocument ? strlen($selectedDocument['content']) : 0;
             <h3 class="text-xl font-semibold text-white mb-4">Создать новый документ</h3>
             <form method="POST" class="grid md:grid-cols-4 gap-4 items-center">
                 <input type="hidden" name="action" value="create">
-                <div class="md:col-span-2">
-                    <label class="block text-sm font-semibold text-slate-200 mb-2">Путь в репозитории</label>
-                    <input type="text" name="path" required placeholder="docs/new-file.md" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                <div>
+                    <label class="block text-sm font-semibold text-slate-200 mb-2">Папка</label>
+                    <input type="text" name="new_folder" value="<?= htmlspecialchars($docsPath); ?>" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                    <p class="text-xs text-slate-400 mt-1">Можно оставить по умолчанию — файл попадёт в общую папку документов.</p>
                 </div>
                 <div>
+                    <label class="block text-sm font-semibold text-slate-200 mb-2">Имя файла</label>
+                    <input type="text" name="new_filename" required placeholder="new-file.md" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                </div>
+                <div class="md:col-span-2">
                     <label class="block text-sm font-semibold text-slate-200 mb-2">Комментарий к коммиту</label>
                     <input type="text" name="message" value="Создание документа" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
                 </div>
@@ -312,8 +465,9 @@ $selectedSize = $selectedDocument ? strlen($selectedDocument['content']) : 0;
                 <input type="hidden" name="action" value="upload">
                 <div class="grid md:grid-cols-2 gap-4">
                     <div>
-                        <label class="block text-sm font-semibold text-slate-200 mb-2">Путь сохранения</label>
-                        <input type="text" name="upload_path" required placeholder="docs/contracts/contract.docx" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                        <label class="block text-sm font-semibold text-slate-200 mb-2">Папка сохранения</label>
+                        <input type="text" name="upload_folder" value="<?= htmlspecialchars($docsPath); ?>" class="w-full p-3 bg-slate-900/50 text-slate-100 border border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                        <p class="text-xs text-slate-400 mt-1">Путь вычисляется сам — можно ничего не менять.</p>
                     </div>
                     <div>
                         <label class="block text-sm font-semibold text-slate-200 mb-2">Комментарий к коммиту</label>
@@ -323,7 +477,7 @@ $selectedSize = $selectedDocument ? strlen($selectedDocument['content']) : 0;
                 <div>
                     <label class="block text-sm font-semibold text-slate-200 mb-2">Файл</label>
                     <input type="file" name="document_file" accept=".doc,.docx,.pdf,.txt,.md" class="w-full text-sm text-slate-200 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-emerald-500 file:text-slate-900 file:font-semibold">
-                    <p class="text-xs text-slate-400 mt-2">Файл будет сохранен в GitHub с коммитом и доступом по ACL.</p>
+                    <p class="text-xs text-slate-400 mt-2">Файл кладётся в выбранную папку автоматически, без ручного пути.</p>
                 </div>
                 <div class="flex justify-end">
                     <button type="submit" class="px-6 py-3 bg-emerald-500 text-slate-900 font-semibold rounded-xl hover:bg-emerald-400 transition">Загрузить в GitHub</button>
