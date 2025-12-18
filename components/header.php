@@ -1,5 +1,7 @@
 <?php
-// Common site header with Tailwind CDN and basic meta tags.
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 ?>
 <!DOCTYPE html>
 <html lang="ru">
@@ -14,12 +16,20 @@
     <link rel="stylesheet" href="/assets/css/tailwind.css">
 </head>
 <body class="bg-gray-50 text-gray-800" style="font-family: 'Inter', sans-serif;">
-    <nav class="bg-gray-900 text-white shadow-lg">
+    <nav class="bg-gray-900 text-white shadow-lg sticky top-0 z-50">
         <div class="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
             <a href="/" class="text-2xl font-bold tracking-tight">LC System</a>
-            <div class="flex items-center gap-4">
-                <a href="/pages/login.php" class="px-4 py-2 rounded-lg border border-white/20 hover:bg-white/10 transition">Войти</a>
-                <a href="/pages/dashboard.php" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 transition">Личный кабинет</a>
+            <div class="flex items-center gap-3 text-sm">
+                <a href="/pages/dashboard.php" class="px-4 py-2 rounded-lg hover:bg-white/10 transition">Документы</a>
+                <a href="/pages/admin.php" class="px-4 py-2 rounded-lg hover:bg-white/10 transition">Администрирование</a>
+                <?php if (!empty($_SESSION['user_id'])): ?>
+                    <span class="hidden sm:inline px-3 py-2 rounded-lg bg-white/10 text-white/80">
+                        <?= htmlspecialchars($_SESSION['username'] ?? 'Пользователь'); ?>
+                    </span>
+                    <a href="/logout.php" class="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 transition">Выйти</a>
+                <?php else: ?>
+                    <a href="/pages/login.php" class="px-4 py-2 rounded-lg border border-white/20 hover:bg-white/10 transition">Войти</a>
+                <?php endif; ?>
             </div>
         </div>
     </nav>
